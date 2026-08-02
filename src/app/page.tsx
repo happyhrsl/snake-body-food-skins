@@ -838,37 +838,40 @@ function moveSnake(snake: Snake, food: Food[], frame: number): void {
     }
   }
 
-  // Boost drain — drops 1pt food per segment lost, 6/sec at 60fps
+  // Boost drain — drops food orbs first, segments vanish only after enough value dropped
+  // Flow: boost → drop orb (score -= orb value) → after GROWTH_COST value dropped → 1 segment lost
   if (snake.boosting && snake.segCount > CFG.MIN_SEGMENTS) {
+    const dropVal = getBoostDropValue(snake.score);
+    // drainAccum counts frames toward next orb drop
     snake.drainAccum += 1.0 / CFG.BOOST_DRAIN_RATE;
-    if (snake.drainAccum >= 1) {
-      const lose = Math.floor(snake.drainAccum);
-      for (let d = 0; d < lose && snake.segCount > CFG.MIN_SEGMENTS; d++) {
-        snake.segCount -= 1;
-        // Always drop 1pt S food behind tail
-        const tailIdx = Math.min(snake.segCount, snake.path.length - 1);
-        const tp = snake.path[tailIdx] || snake.path[snake.path.length - 1];
-        if (tp && distFromOrigin(tp) < CFG.MAP_RADIUS - 50) {
-          const offset = (d % 2 === 0 ? 1 : -1) * CFG.BOOST_DROP_SPREAD;
-          const prevIdx = Math.min(tailIdx + 1, snake.path.length - 1);
-          const pp = snake.path[prevIdx];
-          let fx = tp.x, fy = tp.y;
-          if (pp) {
-            const ddx = tp.x - pp.x, ddy = tp.y - pp.y;
-            const len = Math.sqrt(ddx * ddx + ddy * ddy);
-            if (len > 0) {
-              fx += (ddy / len) * offset;
-              fy -= (ddx / len) * offset;
-            }
-          }
-          const dropFood = makeFood(fx, fy, 'S');
-          dropFood.value = getBoostDropValue(snake.score);
-          food.push(dropFood);
+    while (snake.drainAccum >= 1 && snake.segCount > CFG.MIN_SEGMENTS) {
+      snake.drainAccum -= 1;
+      // Drop food orb behind tail
+      const tailIdx = Math.min(snake.segCount, snake.path.length - 1);
+      const tp = snake.path[tailIdx] || snake.path[snake.path.length - 1];
+      if (tp && distFromOrigin(tp) < CFG.MAP_RADIUS - 50) {
+        const offset = ((snake.segCount - CFG.MIN_SEGMENTS) % 2 === 0 ? 1 : -1) * CFG.BOOST_DROP_SPREAD;
+        const prevIdx = Math.min(tailIdx + 1, snake.path.length - 1);
+        const pp = snake.path[prevIdx];
+        let fx = tp.x, fy = tp.y;
+        if (pp) {
+          const ddx = tp.x - pp.x, ddy = tp.y - pp.y;
+          const len = Math.sqrt(ddx * ddx + ddy * ddy);
+          if (len > 0) { fx += (ddy / len) * offset; fy -= (ddx / len) * offset; }
         }
+        const dropFood = makeFood(fx, fy, 'S');
+        dropFood.value = dropVal;
+        food.push(dropFood);
       }
-      // Deduct score for segments lost (each segment cost GROWTH_COST pts to grow)
-      snake.score = Math.max(0, snake.score - lose * CFG.GROWTH_COST * CFG.SCORE_PER_POINT);
-      snake.drainAccum -= lose;
+      // Score decreases by exact orb value dropped
+      snake.score = Math.max(0, snake.score - dropVal);
+      // Track value toward segment loss using growAccum (negative = drain)
+      snake.growAccum -= dropVal;
+      // When GROWTH_COST worth of orbs dropped → lose 1 segment
+      if (snake.growAccum <= -CFG.GROWTH_COST) {
+        snake.segCount -= 1;
+        snake.growAccum += CFG.GROWTH_COST;
+      }
     }
   }
   // Score-based boost drain: when at min segments, drain score AND drop food orbs
@@ -1839,9 +1842,10 @@ export default function Home() {
           }
           // Instant boost burst — drop food the moment boost activates
           if (p.boosting && !g._wasBoosting) {
-            // Burst from extra segments
+            // Burst: drop orbs, score decreases by orb value, segments lost by value ratio
             if (CFG.BOOST_INSTANT_DROP > 0 && p.segCount > CFG.MIN_SEGMENTS) {
               const burstCount = Math.min(CFG.BOOST_INSTANT_DROP, p.segCount - CFG.MIN_SEGMENTS);
+              let totalBurstValue = 0;
               for (let d = 0; d < burstCount; d++) {
                 const tailIdx = Math.min(p.segCount - 1 - d, p.path.length - 1);
                 const tp = p.path[tailIdx] || p.path[p.path.length - 1];
@@ -1856,12 +1860,22 @@ export default function Home() {
                     if (len > 0) { fx += (ddy / len) * offset; fy -= (ddx / len) * offset; }
                   }
                   const bf = makeFood(fx, fy, 'S');
-                  bf.value = getBoostDropValue(p.score);
+                  const bVal = getBoostDropValue(p.score);
+                  bf.value = bVal;
+                  totalBurstValue += bVal;
                   g.food.push(bf);
                 }
               }
-              p.segCount = Math.max(CFG.MIN_SEGMENTS, p.segCount - burstCount);
-              p.score = Math.max(0, p.score - burstCount * CFG.GROWTH_COST * CFG.SCORE_PER_POINT);
+              // Score decreases by exact value of orbs dropped
+              p.score = Math.max(0, p.score - totalBurstValue);
+              // Lose segments based on value: every GROWTH_COST value dropped = 1 segment
+              const segsToLose = Math.min(
+                Math.floor(totalBurstValue / CFG.GROWTH_COST),
+                p.segCount - CFG.MIN_SEGMENTS
+              );
+              p.segCount -= segsToLose;
+              // Carry over leftover value toward next segment loss
+              p.growAccum -= (totalBurstValue - segsToLose * CFG.GROWTH_COST);
             }
             // Burst from score when at min segments — convert score into food orbs
             if (p.segCount <= CFG.MIN_SEGMENTS && p.score > 0) {
