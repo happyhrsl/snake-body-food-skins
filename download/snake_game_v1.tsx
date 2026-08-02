@@ -1,0 +1,1362 @@
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+
+// ═══════════════════════════════════════════════════════════
+//  SLITHER.IO — ACCURATE RECREATION
+// ═══════════════════════════════════════════════════════════
+
+// ─── Tuning Constants ─────────────────────────────────────
+const MAP_RADIUS = 4000;
+const BASE_SPEED = 2.0;
+const BOOST_SPEED = 3.8;
+const TURN_RATE_MIN = 0.020;     // Turn rate at max fatness (R=93)
+const TURN_RATE_MAX = 0.060;     // Turn rate at min size (R=8)
+const BOOST_TURN_RATE = 0.020;  // Boost always uses slow turn (intentional)
+const SEG_SPACING = 4.5;
+const FOOD_EAT_RADIUS = 2;
+const FOOD_RADIUS = 3;
+const BIG_FOOD_RADIUS = 5;
+const FOOD_COUNT = 600;
+const BOT_COUNT = 10;
+const INITIAL_SEGMENTS = 14;       // Starting size → score 10
+const MIN_SEGMENTS = 10;          // Can drain below initial via boost
+const BOOST_DRAIN_RATE = 15;       // Drain tick interval (frames)
+const COLLISION_SKIP = 3;
+const MAX_SEGMENTS = 1400;         // Max snake length → score 100,000
+const MIN_BODY_RADIUS = 8;
+const MAX_BODY_RADIUS = 93;       // 140% fatness: R=93, Dia=186px at max length
+const MAX_SCORE = 100000;
+
+// Quadratic score: (segCount/MAX)² × 100K — small snakes score low, max = 100K
+function calcScore(segCount: number): number {
+  return Math.round(Math.pow(segCount / MAX_SEGMENTS, 2) * MAX_SCORE);
+}
+const GROW_PER_SMALL = 0.5;       // Fractional growth per small food
+const GROW_PER_BIG = 1.0;         // Fractional growth per big food (1:1 with drain)
+
+// ─── Types ───────────────────────────────────────────────
+interface Vec2 { x: number; y: number }
+
+interface Food {
+  x: number; y: number;
+  radius: number;
+  color: string;
+  glow: string;
+}
+
+interface Wall {
+  x1: number; y1: number;
+  x2: number; y2: number;
+  thickness: number;
+}
+
+type SnakeShape = 'circle' | 'box' | 'triangle' | 'mix_ct' | 'mix_cb' | 'mix_bt' | 'mix_all';
+
+const SNAKE_SHAPES: SnakeShape[] = ['circle', 'box', 'triangle', 'mix_ct', 'mix_cb', 'mix_bt', 'mix_all'];
+
+const SHAPE_LABELS: Record<SnakeShape, string> = {
+  circle: 'Circle',
+  box: 'Box',
+  triangle: 'Triangle',
+  mix_ct: 'Circle + Triangle',
+  mix_cb: 'Circle + Box',
+  mix_bt: 'Box + Triangle',
+  mix_all: 'All Mixed',
+};
+
+interface Snake {
+  path: Vec2[];
+  segCount: number;
+  angle: number;
+  targetAngle: number;
+  speed: number;
+  boosting: boolean;
+  alive: boolean;
+  color: string;
+  stripeColor: string;
+  headColor: string;
+  name: string;
+  isPlayer: boolean;
+  shape: SnakeShape;
+  growAccum: number;          // Fractional growth accumulator
+  drainAccum: number;         // Fractional drain accumulator
+  _cacheFrame: number;
+  _bodyRadius: number;
+  _headRadius: number;
+  _segPos: Vec2[];
+  _segAngles: number[];       // Direction angle per segment
+  _arrowDist: number;       // Smoothed arrow distance for lerp
+  _clippedSegs: Set<number>;  // Segments overlapping walls/other snakes (visual only)
+  aiWanderAngle: number;
+  aiTick: number;
+  boostCooldown: number;
+  respawnTimer: number;
+}
+
+// ─── Math Helpers ────────────────────────────────────────
+const TAU = Math.PI * 2;
+
+function dist(a: Vec2, b: Vec2): number {
+  const dx = a.x - b.x, dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function angleTo(from: Vec2, to: Vec2): number {
+  return Math.atan2(to.y - from.y, to.x - from.x);
+}
+
+function normalizeAngle(a: number): number {
+  while (a > Math.PI) a -= TAU;
+  while (a < -Math.PI) a += TAU;
+  return a;
+}
+
+function shortestAngleDelta(from: number, to: number): number {
+  return normalizeAngle(to - from);
+}
+
+function lerpAngle(from: number, to: number, maxDelta: number): number {
+  const delta = shortestAngleDelta(from, to);
+  if (Math.abs(delta) <= maxDelta) return from + delta;
+  return from + Math.sign(delta) * maxDelta;
+}
+
+function randInCircle(cx: number, cy: number, maxR: number): Vec2 {
+  const a = Math.random() * TAU;
+  const r = Math.sqrt(Math.random()) * maxR;
+  return { x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r };
+}
+
+function distFromOrigin(p: Vec2): number {
+  return Math.sqrt(p.x * p.x + p.y * p.y);
+}
+
+// ─── Color Palettes ──────────────────────────────────────
+const SNAKE_PALETTES = [
+  { color: '#ff4757', stripe: '#ff6b81', head: '#ff8a98' },
+  { color: '#2ed573', stripe: '#7bed9f', head: '#a5f3c4' },
+  { color: '#1e90ff', stripe: '#70a1ff', head: '#a0bfff' },
+  { color: '#ffa502', stripe: '#ffbe76', head: '#ffd093' },
+  { color: '#ff6348', stripe: '#ff9f7f', head: '#ffb8a5' },
+  { color: '#a55eea', stripe: '#c9a5ff', head: '#dcc2ff' },
+  { color: '#2bcbba', stripe: '#6eddd3', head: '#a2ebe4' },
+  { color: '#fd9644', stripe: '#fdbf7f', head: '#fed6aa' },
+  { color: '#45aaf2', stripe: '#78c4f7', head: '#a5d7fa' },
+  { color: '#fc5c65', stripe: '#fd8a90', head: '#feadaf' },
+  { color: '#26de81', stripe: '#67e8a5', head: '#93eebf' },
+  { color: '#e17055', stripe: '#eaa18f', head: '#f0c0b3' },
+];
+
+const FOOD_COLORS = [
+  { c: '#ff4757', g: 'rgba(255,71,87,0.35)' },
+  { c: '#2ed573', g: 'rgba(46,213,115,0.35)' },
+  { c: '#1e90ff', g: 'rgba(30,144,255,0.35)' },
+  { c: '#ffa502', g: 'rgba(255,165,2,0.35)' },
+  { c: '#ff6b81', g: 'rgba(255,107,129,0.35)' },
+  { c: '#7bed9f', g: 'rgba(123,237,159,0.35)' },
+  { c: '#70a1ff', g: 'rgba(112,161,255,0.35)' },
+  { c: '#eccc68', g: 'rgba(236,204,104,0.35)' },
+  { c: '#a29bfe', g: 'rgba(162,155,254,0.35)' },
+  { c: '#fd79a8', g: 'rgba(253,121,168,0.35)' },
+  { c: '#00cec9', g: 'rgba(0,206,201,0.35)' },
+  { c: '#e17055', g: 'rgba(225,112,85,0.35)' },
+];
+
+const BOT_NAMES = [
+  'Viper', 'Cobra', 'Mamba', 'Python', 'Anaconda',
+  'Rattler', 'Sidewinder', 'Asp', 'Boa', 'Adder',
+  'Krait', 'Taipan', 'Copperhead', 'Kingsnake', 'Coral',
+];
+
+// ─── Test Hurdles (walls with gaps near spawn) ────────
+function createTestWalls(): Wall[] {
+  const walls: Wall[] = [];
+  const T = 8; // wall thickness
+
+  // All walls placed far from spawn (0,0) — minimum ~500 units away
+
+  // Wall 1: horizontal, gap in center (at y=-500)
+  walls.push({ x1: -200, y1: -500, x2: -18, y2: -500, thickness: T });
+  walls.push({ x1: 18, y1: -500, x2: 200, y2: -500, thickness: T });
+
+  // Wall 2: vertical, gap in center (at x=500)
+  walls.push({ x1: 500, y1: -200, x2: 500, y2: -18, thickness: T });
+  walls.push({ x1: 500, y1: 18, x2: 500, y2: 200, thickness: T });
+
+  // Wall 3: diagonal, gap (top-right area)
+  walls.push({ x1: 650, y1: 100, x2: 555, y2: 8, thickness: T });
+  walls.push({ x1: 535, y1: -8, x2: 460, y2: -100, thickness: T });
+
+  // Wall 4: horizontal, smaller gap (at y=500)
+  walls.push({ x1: -180, y1: 500, x2: -10, y2: 500, thickness: T });
+  walls.push({ x1: 10, y1: 500, x2: 180, y2: 500, thickness: T });
+
+  // Wall 5: vertical wall left side (at x=-500)
+  walls.push({ x1: -500, y1: -180, x2: -500, y2: -15, thickness: T });
+  walls.push({ x1: -500, y1: 15, x2: -500, y2: 180, thickness: T });
+
+  // Wall 6: horizontal further out (at y=-600)
+  walls.push({ x1: -250, y1: -600, x2: -22, y2: -600, thickness: T });
+  walls.push({ x1: 22, y1: -600, x2: 250, y2: -600, thickness: T });
+
+  // Wall 7: angled wall bottom-left
+  walls.push({ x1: -570, y1: -460, x2: -490, y2: -370, thickness: T });
+  walls.push({ x1: -480, y1: -360, x2: -410, y2: -280, thickness: T });
+
+  // Wall 8: vertical (at x=-600)
+  walls.push({ x1: -600, y1: -160, x2: -600, y2: -12, thickness: T });
+  walls.push({ x1: -600, y1: 12, x2: -600, y2: 160, thickness: T });
+
+  // Wall 9: horizontal at y=600
+  walls.push({ x1: -200, y1: 600, x2: -15, y2: 600, thickness: T });
+  walls.push({ x1: 15, y1: 600, x2: 200, y2: 600, thickness: T });
+
+  // Wall 10: diagonal bottom-right
+  walls.push({ x1: 460, y1: 560, x2: 540, y2: 480, thickness: T });
+  walls.push({ x1: 550, y1: 470, x2: 630, y2: 380, thickness: T });
+
+  return walls;
+}
+
+// Distance from point to line segment
+function distToSegment(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
+  const dx = x2 - x1, dy = y2 - y1;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return dist({ x: px, y: py }, { x: x1, y: y1 });
+  let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  const cx = x1 + t * dx, cy = y1 + t * dy;
+  return dist({ x: px, y: py }, { x: cx, y: cy });
+}
+
+function checkWallCollision(snakes: Snake[], walls: Wall[], food: Food[]): void {
+  for (const snake of snakes) {
+    if (!snake.alive) continue;
+    const head = snake.path[0];
+    // Full body radius hitbox for walls
+    const headR = snake._headRadius;
+    for (const w of walls) {
+      const hitR = w.thickness / 2;
+      const d = distToSegment(head.x, head.y, w.x1, w.y1, w.x2, w.y2);
+      if (d < hitR) {
+        killSnake(snake, food);
+        break;
+      }
+    }
+  }
+}
+
+// ─── Body Overlap Detection (visual only, no death) ────────
+function detectBodyClips(snakes: Snake[], walls: Wall[]): void {
+  for (const snake of snakes) {
+    if (!snake.alive) continue;
+    snake._clippedSegs.clear();
+    const segs = snake._segPos;
+    const bodyR = snake._bodyRadius;
+
+    // Check against walls
+    for (let i = 1; i < snake.segCount - 1; i++) {
+      const sp = segs[i];
+      if (!sp) continue;
+      for (const w of walls) {
+        const hitR = bodyR + w.thickness / 2;
+        const d = distToSegment(sp.x, sp.y, w.x1, w.y1, w.x2, w.y2);
+        if (d < hitR) { snake._clippedSegs.add(i); break; }
+      }
+    }
+
+    // Check against other snakes' bodies
+    for (const other of snakes) {
+      if (other === snake || !other.alive) continue;
+      const oSegs = other._segPos;
+      const oBodyR = other._bodyRadius;
+      const clipDist = bodyR + oBodyR;
+      const step = Math.max(1, Math.floor(other.segCount / 60));
+      for (let i = 1; i < snake.segCount - 1; i++) {
+        if (snake._clippedSegs.has(i)) continue;
+        const sp = segs[i];
+        if (!sp) continue;
+        for (let j = COLLISION_SKIP; j < other.segCount; j += step) {
+          const op = oSegs[j];
+          if (!op) continue;
+          const dx = sp.x - op.x, dy = sp.y - op.y;
+          if (dx * dx + dy * dy < clipDist * clipDist) {
+            snake._clippedSegs.add(i);
+            break;
+          }
+        }
+      }
+    }
+  }
+}
+
+// ─── Entity Factories ────────────────────────────────────
+function makeFood(x: number, y: number, big = false): Food {
+  const fc = FOOD_COLORS[Math.floor(Math.random() * FOOD_COLORS.length)];
+  return { x, y, radius: big ? BIG_FOOD_RADIUS : FOOD_RADIUS, color: fc.c, glow: fc.g };
+}
+
+// Fat curve: linear from MIN (10 segs) to MAX (874 segs)
+function calcBodyRadius(segCount: number): number {
+  const t = Math.min((segCount - MIN_SEGMENTS) / (MAX_SEGMENTS - MIN_SEGMENTS), 1);
+  return MIN_BODY_RADIUS + t * (MAX_BODY_RADIUS - MIN_BODY_RADIUS);
+}
+
+function calcHeadRadius(segCount: number): number {
+  return calcBodyRadius(segCount); // Same size as body
+}
+
+function makeSnake(isPlayer: boolean, shape?: SnakeShape): Snake {
+  const pal = SNAKE_PALETTES[isPlayer ? 0 : Math.floor(Math.random() * SNAKE_PALETTES.length)];
+  const snakeShape = shape || (isPlayer ? 'circle' as SnakeShape : SNAKE_SHAPES[Math.floor(Math.random() * SNAKE_SHAPES.length)]);
+  const angle = Math.random() * TAU;
+  const startPos = isPlayer ? { x: 0, y: 0 } : randInCircle(0, 0, MAP_RADIUS * 0.7);
+  const path: Vec2[] = [];
+  const pathLen = INITIAL_SEGMENTS * SEG_SPACING + 20;
+  for (let i = 0; i < pathLen; i++) {
+    path.push({
+      x: startPos.x - Math.cos(angle) * i,
+      y: startPos.y - Math.sin(angle) * i,
+    });
+  }
+  return {
+    path,
+    segCount: INITIAL_SEGMENTS,
+    angle,
+    targetAngle: angle,
+    speed: BASE_SPEED,
+    boosting: false,
+    alive: true,
+    color: pal.color,
+    stripeColor: pal.stripe,
+    headColor: pal.head,
+    name: isPlayer ? 'You' : BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
+    isPlayer,
+    shape: snakeShape,
+    growAccum: 0,
+    drainAccum: 0,
+    _cacheFrame: -1,
+    _bodyRadius: calcBodyRadius(INITIAL_SEGMENTS),
+    _headRadius: calcHeadRadius(INITIAL_SEGMENTS),
+    _segPos: [],
+    _segAngles: [],
+    _arrowDist: 0,    _clippedSegs: new Set(),
+    aiWanderAngle: angle,
+    aiTick: Math.floor(Math.random() * 60),
+    boostCooldown: 0,
+    respawnTimer: 0,
+  };
+}
+
+// ─── Precompute segment positions (once per frame) ───────
+function cacheSegmentPositions(snake: Snake, frame: number): void {
+  if (snake._cacheFrame === frame) return;
+  snake._cacheFrame = frame;
+  snake._bodyRadius = calcBodyRadius(snake.segCount);
+  snake._headRadius = calcHeadRadius(snake.segCount);
+
+  const count = snake.segCount;
+  const pos = snake._segPos;
+  const angles = snake._segAngles;
+  pos.length = count;
+  angles.length = count;
+  if (count === 0) return;
+
+  pos[0] = snake.path[0];
+  angles[0] = snake.angle;
+  if (count === 1) return;
+
+  let segIdx = 1;
+  let walked = 0;
+  let nextTarget = SEG_SPACING;
+
+  for (let i = 0; i < snake.path.length - 1 && segIdx < count; i++) {
+    const dx = snake.path[i + 1].x - snake.path[i].x;
+    const dy = snake.path[i + 1].y - snake.path[i].y;
+    const edgeLen = Math.sqrt(dx * dx + dy * dy);
+    const edgeEnd = walked + edgeLen;
+
+    while (edgeEnd >= nextTarget && segIdx < count) {
+      const t = edgeLen > 0 ? (nextTarget - walked) / edgeLen : 0;
+      pos[segIdx] = {
+        x: snake.path[i].x + dx * t,
+        y: snake.path[i].y + dy * t,
+      };
+      segIdx++;
+      nextTarget += SEG_SPACING;
+    }
+
+    walked = edgeEnd;
+  }
+
+  const last = pos[segIdx - 1] || snake.path[0];
+  for (let i = segIdx; i < count; i++) {
+    pos[i] = last;
+  }
+
+  // Compute per-segment angles for non-circle shapes
+  for (let i = 1; i < count; i++) {
+    if (pos[i] && pos[i - 1]) {
+      angles[i] = Math.atan2(pos[i - 1].y - pos[i].y, pos[i - 1].x - pos[i].x);
+    } else {
+      angles[i] = snake.angle;
+    }
+  }
+}
+
+// ─── Move snake one frame ────────────────────────────────
+function moveSnake(snake: Snake, food: Food[], frame: number): void {
+  if (!snake.alive) return;
+
+  const head = snake.path[0];
+
+  // Steering — small snakes turn snappy, big snakes turn wide
+  const sizeT = Math.min((snake._bodyRadius - MIN_BODY_RADIUS) / (MAX_BODY_RADIUS - MIN_BODY_RADIUS), 1);
+  const normalRate = TURN_RATE_MAX - sizeT * (TURN_RATE_MAX - TURN_RATE_MIN);
+  const rate = snake.boosting ? BOOST_TURN_RATE : normalRate;
+  snake.angle = lerpAngle(snake.angle, snake.targetAngle, rate);
+
+  // Speed
+  snake.speed = snake.boosting ? BOOST_SPEED : BASE_SPEED;
+
+  // New head
+  const nx = head.x + Math.cos(snake.angle) * snake.speed;
+  const ny = head.y + Math.sin(snake.angle) * snake.speed;
+
+  // Boundary
+  if (distFromOrigin({ x: nx, y: ny }) > MAP_RADIUS) {
+    killSnake(snake, food);
+    return;
+  }
+
+  snake.path.unshift({ x: nx, y: ny });
+
+  const maxPathLen = Math.ceil(snake.segCount * SEG_SPACING) + 20;
+  if (snake.path.length > maxPathLen) {
+    snake.path.length = maxPathLen;
+  }
+
+  // Eat food
+  const eatDist = calcHeadRadius(snake.segCount) + FOOD_EAT_RADIUS;
+  for (let i = food.length - 1; i >= 0; i--) {
+    const f = food[i];
+    const d = dist({ x: nx, y: ny }, f);
+    if (d < eatDist + f.radius) {
+      food[i] = food[food.length - 1];
+      food.pop();
+      // FIX #1: Fractional growth — much slower than before
+      snake.growAccum += f.radius >= BIG_FOOD_RADIUS ? GROW_PER_BIG : GROW_PER_SMALL;
+      if (snake.growAccum >= 1) {
+        const add = Math.floor(snake.growAccum);
+        snake.segCount = Math.min(snake.segCount + add, MAX_SEGMENTS);
+        snake.growAccum -= add;
+      }
+    }
+  }
+
+  // Boost drain — fractional, drops food close together along tail
+  if (snake.boosting && snake.segCount > MIN_SEGMENTS) {
+    snake.drainAccum += 0.02;
+    if (snake.drainAccum >= 1) {
+      const lose = Math.floor(snake.drainAccum);
+      for (let d = 0; d < lose && snake.segCount > MIN_SEGMENTS; d++) {
+        snake.segCount -= 1;
+        const tailIdx = Math.min(snake.segCount, snake.path.length - 1);
+        const tp = snake.path[tailIdx] || snake.path[snake.path.length - 1];
+        if (tp && distFromOrigin(tp) < MAP_RADIUS - 50) {
+          // Small perpendicular offset so drops stay close together
+          const offset = (d % 2 === 0 ? 1 : -1) * 2;
+          const prevIdx = Math.min(tailIdx + 1, snake.path.length - 1);
+          const pp = snake.path[prevIdx];
+          let fx = tp.x, fy = tp.y;
+          if (pp) {
+            const dx = tp.x - pp.x, dy = tp.y - pp.y;
+            const len = Math.sqrt(dx * dx + dy * dy);
+            if (len > 0) {
+              fx += (dy / len) * offset;
+              fy -= (dx / len) * offset;
+            }
+          }
+          food.push(makeFood(fx, fy, true));
+        }
+      }
+      snake.drainAccum -= lose;
+    }
+  }
+}
+
+// ─── Kill snake → food explosion ────────────────────────
+function killSnake(snake: Snake, food: Food[]): void {
+  snake.alive = false;
+  const step = Math.max(2, Math.floor(snake.segCount / 40));
+  for (let i = 0; i < snake.segCount; i += step) {
+    let pos: Vec2;
+    if (snake._segPos.length > i) {
+      pos = snake._segPos[i];
+    } else {
+      pos = snake.path[Math.min(i * 2, snake.path.length - 1)];
+    }
+    if (distFromOrigin(pos) < MAP_RADIUS - 50) {
+      food.push(makeFood(
+        pos.x + (Math.random() - 0.5) * 12,
+        pos.y + (Math.random() - 0.5) * 12,
+        true
+      ));
+    }
+  }
+}
+
+// ─── Collision Detection ─────────────────────────────────
+function checkCollisions(snakes: Snake[], food: Food[]): void {
+  for (const snake of snakes) {
+    if (!snake.alive) continue;
+    const headPos = snake.path[0];
+    const myHeadR = snake._headRadius;
+
+    for (const other of snakes) {
+      if (other === snake || !other.alive) continue;
+      // Full body circle collision — head hits body = death
+      const bodyR = other._bodyRadius;
+      const hitDist = bodyR;
+      const segs = other._segPos;
+      const maxI = Math.min(segs.length, other.segCount);
+      for (let i = COLLISION_SKIP; i < maxI; i++) {
+        const sp = segs[i];
+        const dx = headPos.x - sp.x;
+        const dy = headPos.y - sp.y;
+        if (dx * dx + dy * dy < hitDist * hitDist) {
+          killSnake(snake, food);
+          break;
+        }
+      }
+      if (!snake.alive) break;
+    }
+  }
+}
+
+// ─── Bot AI ──────────────────────────────────────────────
+function updateBotAI(bot: Snake, snakes: Snake[], food: Food[]): void {
+  if (!bot.alive) return;
+  const head = bot.path[0];
+  const distCenter = distFromOrigin(head);
+
+  if (distCenter > MAP_RADIUS - 400) {
+    bot.targetAngle = angleTo(head, { x: 0, y: 0 });
+    bot.boosting = distCenter > MAP_RADIUS - 200;
+    return;
+  }
+
+  bot.boostCooldown = Math.max(0, bot.boostCooldown - 1);
+  bot.boosting = false;
+
+  let danger = false;
+  for (const other of snakes) {
+    if (other === bot || !other.alive) continue;
+    const segs = other._segPos;
+    const checkLen = Math.min(segs.length, 50);
+    const dangerDist = (bot._headRadius + other._bodyRadius) * 2.5;
+    const dangerDist2 = dangerDist * dangerDist;
+    const boostDist = (bot._headRadius + other._bodyRadius) * 1.5;
+    const boostDist2 = boostDist * boostDist;
+    for (let i = COLLISION_SKIP; i < checkLen; i += Math.max(1, Math.floor(other.segCount / 40))) {
+      const sp = segs[i];
+      if (!sp) continue;
+      const dx = head.x - sp.x;
+      const dy = head.y - sp.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < dangerDist2) {
+        bot.targetAngle = angleTo(sp, head);
+        bot.aiTick = 30;
+        danger = true;
+        if (d2 < boostDist2) bot.boosting = true;
+        break;
+      }
+    }
+    if (danger) break;
+  }
+  if (danger) return;
+
+  bot.aiTick--;
+  if (bot.aiTick <= 0) {
+    bot.aiTick = 20 + Math.floor(Math.random() * 40);
+
+    let bestFood: Food | null = null;
+    let bestDist2 = 350 * 350;
+    for (const f of food) {
+      const dx = head.x - f.x;
+      const dy = head.y - f.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestDist2) {
+        bestDist2 = d2;
+        bestFood = f;
+      }
+    }
+
+    if (bestFood) {
+      bot.targetAngle = angleTo(head, bestFood);
+    } else {
+      bot.aiWanderAngle += (Math.random() - 0.5) * 1.2;
+      bot.targetAngle = bot.aiWanderAngle;
+    }
+  }
+}
+
+// ─── Canvas Renderer ─────────────────────────────────────
+function renderGame(
+  ctx: CanvasRenderingContext2D,
+  W: number, H: number,
+  cam: Vec2,
+  player: Snake | null,
+  bots: Snake[],
+  food: Food[],
+  frame: number,
+  zoom: number,
+  walls: Wall[],
+) {
+  ctx.fillStyle = '#0b1120';
+  ctx.fillRect(0, 0, W, H);
+
+  // FIX #7: Zoom-aware offset
+  const ox = W / 2 - cam.x * zoom;
+  const oy = H / 2 - cam.y * zoom;
+
+  // Visible world bounds (for culling)
+  const viewL = cam.x - W / (2 * zoom) - 30;
+  const viewR = cam.x + W / (2 * zoom) + 30;
+  const viewT = cam.y - H / (2 * zoom) - 30;
+  const viewB = cam.y + H / (2 * zoom) + 30;
+
+  // ── Grid ─────────────────────────────────────────────
+  const GRID = 100;
+  ctx.strokeStyle = 'rgba(255,255,255,0.035)';
+  ctx.lineWidth = 1;
+  const gx0 = Math.floor(viewL / GRID) * GRID;
+  const gy0 = Math.floor(viewT / GRID) * GRID;
+  ctx.beginPath();
+  for (let wx = gx0; wx <= viewR + GRID; wx += GRID) {
+    const sx = wx * zoom + ox;
+    ctx.moveTo(sx, 0);
+    ctx.lineTo(sx, H);
+  }
+  for (let wy = gy0; wy <= viewB + GRID; wy += GRID) {
+    const sy = wy * zoom + oy;
+    ctx.moveTo(0, sy);
+    ctx.lineTo(W, sy);
+  }
+  ctx.stroke();
+
+  // ── Map boundary ─────────────────────────────────────
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(ox, oy, MAP_RADIUS * zoom, 0, TAU);
+  ctx.strokeStyle = 'rgba(255,60,60,0.45)';
+  ctx.lineWidth = 6;
+  ctx.stroke();
+  const dg = ctx.createRadialGradient(ox, oy, (MAP_RADIUS - 120) * zoom, ox, oy, MAP_RADIUS * zoom);
+  dg.addColorStop(0, 'rgba(255,0,0,0)');
+  dg.addColorStop(1, 'rgba(255,0,0,0.12)');
+  ctx.fillStyle = dg;
+  ctx.fill();
+  ctx.restore();
+
+  // ── Food ─────────────────────────────────────────────
+  for (const f of food) {
+    if (f.x < viewL || f.x > viewR || f.y < viewT || f.y > viewB) continue;
+    const sx = f.x * zoom + ox, sy = f.y * zoom + oy;
+    ctx.beginPath();
+    ctx.arc(sx, sy, f.radius * zoom + 3 * zoom, 0, TAU);
+    ctx.fillStyle = f.glow;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(sx, sy, f.radius * zoom, 0, TAU);
+    ctx.fillStyle = f.color;
+    ctx.fill();
+  }
+
+  // ── Test Walls ─────────────────────────────────────
+  ctx.lineCap = 'round';
+  for (const w of walls) {
+    const sx1 = w.x1 * zoom + ox, sy1 = w.y1 * zoom + oy;
+    const sx2 = w.x2 * zoom + ox, sy2 = w.y2 * zoom + oy;
+    // Glow
+    ctx.beginPath();
+    ctx.moveTo(sx1, sy1);
+    ctx.lineTo(sx2, sy2);
+    ctx.strokeStyle = 'rgba(255,200,50,0.15)';
+    ctx.lineWidth = (w.thickness + 12) * zoom;
+    ctx.stroke();
+    // Wall body
+    ctx.beginPath();
+    ctx.moveTo(sx1, sy1);
+    ctx.lineTo(sx2, sy2);
+    ctx.strokeStyle = 'rgba(255,200,50,0.7)';
+    ctx.lineWidth = w.thickness * zoom;
+    ctx.stroke();
+  }
+
+  // ── Cache & draw snakes ─────────────────────────────
+  for (const b of bots) { if (b.alive) cacheSegmentPositions(b, frame); }
+  if (player?.alive) cacheSegmentPositions(player, frame);
+
+  const allAlive = bots.filter(b => b.alive);
+  if (player?.alive) allAlive.push(player);
+
+  for (const snake of allAlive) {
+    drawSnake(ctx, snake, ox, oy, W, H, frame, zoom, viewL, viewR, viewT, viewB);
+  }
+
+  // ── Minimap ──────────────────────────────────────────
+  const mmR = 50;
+  const mmX = W - mmR - 14;
+  const mmY = mmR + 14;
+  const mmS = mmR / MAP_RADIUS;
+
+  ctx.beginPath();
+  ctx.arc(mmX, mmY, mmR, 0, TAU);
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,60,60,0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  for (const b of bots) {
+    if (!b.alive) continue;
+    ctx.beginPath();
+    ctx.arc(mmX + b.path[0].x * mmS, mmY + b.path[0].y * mmS, 2, 0, TAU);
+    ctx.fillStyle = b.color;
+    ctx.fill();
+  }
+  if (player?.alive) {
+    ctx.beginPath();
+    ctx.arc(mmX + player.path[0].x * mmS, mmY + player.path[0].y * mmS, 3.5, 0, TAU);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+  }
+
+  // ── Score HUD ────────────────────────────────────────
+  if (player?.alive) {
+    ctx.save();
+    ctx.globalAlpha = 1;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 20px -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.fillText(`Score: ${calcScore(player.segCount).toLocaleString()}`, 16, 16);
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.font = '14px -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.fillText(`Length: ${player.segCount} / ${MAX_SEGMENTS}`, 16, 42);
+    const fatPct = Math.round(((player._bodyRadius - MIN_BODY_RADIUS) / (MAX_BODY_RADIUS - MIN_BODY_RADIUS)) * 100);
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = '12px -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.fillText(`Fat: ${fatPct}%  ·  Body R: ${player._bodyRadius.toFixed(1)}  ·  Dia: ${(player._bodyRadius * 2).toFixed(0)}px`, 16, 60);
+    ctx.restore();
+  }
+}
+
+// ─── Draw Single Snake ───────────────────────────────────
+function drawSnake(
+  ctx: CanvasRenderingContext2D,
+  snake: Snake,
+  ox: number, oy: number,
+  W: number, H: number,
+  frame: number,
+  zoom: number,
+  viewL: number, viewR: number, viewT: number, viewB: number,
+) {
+  const segs = snake._segPos;
+  const segCount = snake.segCount;
+  const bodyR = snake._bodyRadius * zoom;   // zoom-scaled
+  const headR = snake._headRadius * zoom;
+
+  // Helper: pick shape for segment index based on snake.shape
+  const pickShape = (i: number): 'circle' | 'box' | 'triangle' => {
+    switch (snake.shape) {
+      case 'circle': return 'circle';
+      case 'box': return 'box';
+      case 'triangle': return 'triangle';
+      case 'mix_ct': return (Math.floor(i / 2) % 2 === 0) ? 'circle' : 'triangle';
+      case 'mix_cb': return (Math.floor(i / 2) % 2 === 0) ? 'circle' : 'box';
+      case 'mix_bt': return (Math.floor(i / 2) % 2 === 0) ? 'box' : 'triangle';
+      case 'mix_all': return ['circle', 'box', 'triangle'][i % 3] as 'circle' | 'box' | 'triangle';
+    }
+  };
+
+  // Draw body segments with shape
+  for (let i = segCount - 1; i >= 1; i--) {
+    const pos = segs[i];
+    if (!pos) continue;
+    if (pos.x < viewL || pos.x > viewR || pos.y < viewT || pos.y > viewB) continue;
+
+    const sx = pos.x * zoom + ox, sy = pos.y * zoom + oy;
+    const stripe = Math.floor(i / 4) % 2 === 0;
+    const fillC = stripe ? snake.color : snake.stripeColor;
+    const segAngle = snake._segAngles[i] ?? snake.angle;
+    const sh = pickShape(i);
+    const clipped = snake._clippedSegs.has(i);
+
+    if (clipped) ctx.globalAlpha = 0.2;
+    ctx.fillStyle = fillC;
+    if (sh === 'circle') {
+      ctx.beginPath();
+      ctx.arc(sx, sy, bodyR, 0, TAU);
+      ctx.fill();
+    } else if (sh === 'box') {
+      const half = bodyR * 1.05;
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.rotate(segAngle);
+      ctx.fillRect(-half, -half, half * 2, half * 2);
+      ctx.restore();
+    } else if (sh === 'triangle') {
+      const r = bodyR * 1.25;
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.rotate(segAngle);
+      ctx.beginPath();
+      ctx.moveTo(r, 0);
+      ctx.lineTo(-r * 0.7, -r * 0.85);
+      ctx.lineTo(-r * 0.7, r * 0.85);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+    if (clipped) ctx.globalAlpha = 1;
+  }
+
+  // Head — always circle for clean eyes
+  const hx = snake.path[0].x * zoom + ox;
+  const hy = snake.path[0].y * zoom + oy;
+  if (hx < -60 || hx > W + 60 || hy < -60 || hy > H + 60) return;
+
+  // Boost glow
+  if (snake.boosting) {
+    ctx.beginPath();
+    ctx.arc(hx, hy, headR + 8 * zoom, 0, TAU);
+    ctx.fillStyle = snake.color + '33';
+    ctx.fill();
+  }
+
+  // Head circle
+  ctx.beginPath();
+  ctx.arc(hx, hy, headR, 0, TAU);
+  ctx.fillStyle = snake.headColor;
+  ctx.fill();
+
+  // Collision ring — shows death boundary (player only)
+  if (snake.isPlayer) {
+    // Body segments: show TRUE kill zone matching collision code
+    const killR = bodyR;
+    for (let i = 2; i < segCount - 2; i += 2) {
+      const pos = segs[i];
+      if (!pos) continue;
+      if (pos.x < viewL || pos.x > viewR || pos.y < viewT || pos.y > viewB) continue;
+      const sx = pos.x * zoom + ox, sy = pos.y * zoom + oy;
+      ctx.beginPath();
+      ctx.arc(sx, sy, killR, 0, TAU);
+      ctx.strokeStyle = 'rgba(255,80,80,0.45)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+    // Head: 3px line through center (forward direction)
+    const cl = bodyR * 0.8;
+    ctx.beginPath();
+    ctx.moveTo(hx + Math.cos(snake.angle) * cl, hy + Math.sin(snake.angle) * cl);
+    ctx.lineTo(hx - Math.cos(snake.angle) * cl, hy - Math.sin(snake.angle) * cl);
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    // Tail: single thin line through center
+    const tailPos = segs[segCount - 1];
+    if (tailPos) {
+      const tx = tailPos.x * zoom + ox, ty = tailPos.y * zoom + oy;
+      if (tx > -60 && tx < W + 60 && ty > -60 && ty < H + 60) {
+        const tl = bodyR * 0.4;
+        const ta = snake._segAngles[segCount - 1] ?? snake.angle;
+        ctx.beginPath();
+        ctx.moveTo(tx + Math.cos(ta) * tl, ty + Math.sin(ta) * tl);
+        ctx.lineTo(tx - Math.cos(ta) * tl, ty - Math.sin(ta) * tl);
+        ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+      }
+    }
+  }
+
+  // Moving eyes — pupils shift toward targetAngle, scale with body
+  const lookAngle = snake.targetAngle;
+  const turnDelta = shortestAngleDelta(snake.angle, lookAngle);
+  const eyeShift = Math.max(-1, Math.min(1, turnDelta / 0.5));
+
+  const eo = bodyR * 0.45;
+  const eyeSize = bodyR * 0.38;
+  const pupilSize = eyeSize * 0.5;
+  const pupilOffset = eyeSize * 0.4 * eyeShift;
+
+  for (const side of [-0.55, 0.55]) {
+    const ea = snake.angle + side;
+    const ex = hx + Math.cos(ea) * eo;
+    const ey = hy + Math.sin(ea) * eo;
+    // White of eye
+    ctx.beginPath();
+    ctx.arc(ex, ey, eyeSize, 0, TAU);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+    // Pupil — shifted toward look direction
+    ctx.beginPath();
+    ctx.arc(
+      ex + Math.cos(lookAngle) * pupilOffset + Math.cos(snake.angle) * eyeSize * 0.12,
+      ey + Math.sin(lookAngle) * pupilOffset + Math.sin(snake.angle) * eyeSize * 0.12,
+      pupilSize, 0, TAU,
+    );
+    ctx.fillStyle = '#111';
+    ctx.fill();
+  }
+
+  // Center line: INVISIBLE — collision still uses spine-only hitbox (20% of body radius)
+  // Visual line removed; spine collision in checkCollisions() remains active
+
+  // Direction arrow — player only, smooth lerp, extends when boosting
+  if (snake.isPlayer) {
+  const arrowAngle = snake.targetAngle;
+  const targetDist = bodyR * 7 + (snake.boosting ? 55 * zoom : 0);
+  snake._arrowDist += (targetDist - snake._arrowDist) * 0.035; // Slower smooth lerp
+  const arrowDist = snake._arrowDist;
+  const arrowTipX = hx + Math.cos(arrowAngle) * arrowDist;
+  const arrowTipY = hy + Math.sin(arrowAngle) * arrowDist;
+  const arrowSize = Math.max(8 * zoom, bodyR * 0.7);
+  const perpX = Math.cos(arrowAngle + Math.PI / 2);
+  const perpY = Math.sin(arrowAngle + Math.PI / 2);
+  const backX = Math.cos(arrowAngle + Math.PI);
+  const backY = Math.sin(arrowAngle + Math.PI);
+
+  ctx.beginPath();
+  ctx.moveTo(arrowTipX, arrowTipY);
+  ctx.lineTo(arrowTipX + backX * arrowSize + perpX * arrowSize * 0.85,
+             arrowTipY + backY * arrowSize + perpY * arrowSize * 0.85);
+  ctx.lineTo(arrowTipX + backX * arrowSize - perpX * arrowSize * 0.85,
+             arrowTipY + backY * arrowSize - perpY * arrowSize * 0.85);
+  ctx.closePath();
+  ctx.fillStyle = snake.boosting ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.55)';
+  ctx.fill();
+  } // end player-only arrow
+
+  // Name label (screen-space font, not zoomed)
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  const nameSize = Math.max(10, Math.min(13, snake._bodyRadius * 0.9));
+  ctx.font = `bold ${nameSize}px -apple-system, BlinkMacSystemFont, sans-serif`;
+  ctx.fillText(`${snake.name}`, hx, hy - bodyR - 6 * zoom);
+  ctx.restore();
+}
+
+// ═══════════════════════════════════════════════════════════
+//  REACT COMPONENT
+// ═══════════════════════════════════════════════════════════
+export default function Home() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [screen, setScreen] = useState<'start' | 'playing' | 'dead'>('start');
+  const [deathScore, setDeathScore] = useState(0);
+  const [isBoosting, setIsBoosting] = useState(false);
+  const [shapeIdx, setShapeIdx] = useState(0);
+  const shapeRef = useRef(0);
+
+  useEffect(() => {
+    const cvs = canvasRef.current;
+    if (!cvs) return;
+
+    const g = {
+      screen: 'start' as 'start' | 'playing' | 'dead',
+      player: null as Snake | null,
+      bots: [] as Snake[],
+      food: [] as Food[],
+      walls: createTestWalls(),
+      cam: { x: 0, y: 0 },
+      zoom: 1.0,
+      touch: { active: false, x: 0, y: 0 },
+      boost: false,
+      // FIX #6: Track pointer IDs so multi-touch boost works
+      steerPointerId: -1,
+      boostPointerId: -1,
+      frame: 0,
+      selectedShape: SNAKE_SHAPES[0],
+    };
+
+    // ── Resize ───────────────────────────────────────────
+    const resize = () => {
+      const dpr = window.devicePixelRatio || 1;
+      cvs.width = window.innerWidth * dpr;
+      cvs.height = window.innerHeight * dpr;
+      cvs.style.width = window.innerWidth + 'px';
+      cvs.style.height = window.innerHeight + 'px';
+      cvs.getContext('2d')?.scale(dpr, dpr);
+    };
+    resize();
+    window.addEventListener('resize', resize);
+
+    // ── Start / Restart ──────────────────────────────────
+    const startGame = () => {
+      g.selectedShape = SNAKE_SHAPES[shapeRef.current];
+      g.player = makeSnake(true, g.selectedShape);
+      g.bots = Array.from({ length: BOT_COUNT }, () => {
+        const bot = makeSnake(false);
+        bot.segCount = 10 + Math.floor(Math.random() * 50);
+        return bot;
+      });
+      g.food = Array.from({ length: FOOD_COUNT }, () => {
+        const p = randInCircle(0, 0, MAP_RADIUS - 100);
+        return makeFood(p.x, p.y, Math.random() < 0.1);
+      });
+      g.cam = { x: 0, y: 0 };
+      g.zoom = 1.0;
+      g.frame = 0;
+      g.touch.active = false;
+      g.boost = false;
+      g.steerPointerId = -1;
+      g.boostPointerId = -1;
+      g.screen = 'playing';
+      setScreen('playing');
+    };
+
+    const handleDeath = () => {
+      g.screen = 'dead';
+      setDeathScore(calcScore(g.player?.segCount ?? 0));
+      setScreen('dead');
+      g.boost = false;
+      setIsBoosting(false);
+      g.steerPointerId = -1;
+      g.boostPointerId = -1;
+    };
+
+    // ── FIX #6: Multi-touch input with pointer ID tracking ──
+    const onDown = (e: PointerEvent) => {
+      e.preventDefault();
+      const r = cvs.getBoundingClientRect();
+      const x = e.clientX - r.left;
+      const y = e.clientY - r.top;
+      const bw = window.innerWidth, bh = window.innerHeight;
+
+      if (g.screen === 'playing') {
+        // Boost button zone (bottom-right)
+        if (x > bw - 110 && y > bh - 110) {
+          g.boostPointerId = e.pointerId;
+          g.boost = true;
+          setIsBoosting(true);
+          return;
+        }
+        // Steer
+        g.steerPointerId = e.pointerId;
+        g.touch = { active: true, x, y };
+        return;
+      }
+      // Don't auto-start from canvas on start screen (shape selector handles it)
+      if (g.screen === 'dead') startGame();
+    };
+
+    const onMove = (e: PointerEvent) => {
+      e.preventDefault();
+      const r = cvs.getBoundingClientRect();
+      const x = e.clientX - r.left;
+      const y = e.clientY - r.top;
+      const bw = window.innerWidth, bh = window.innerHeight;
+
+      if (g.screen !== 'playing') return;
+
+      // If this pointer is the boost pointer, track it
+      if (e.pointerId === g.boostPointerId) {
+        if (x <= bw - 110 || y <= bh - 110) {
+          // Moved out of boost zone
+          g.boostPointerId = -1;
+          g.boost = false;
+          setIsBoosting(false);
+        }
+        return;
+      }
+
+      // Steer pointer
+      if (e.pointerId === g.steerPointerId || g.steerPointerId === -1) {
+        if (x > bw - 110 && y > bh - 110) {
+          // Moved into boost zone
+          if (g.steerPointerId === e.pointerId) g.steerPointerId = -1;
+          g.boostPointerId = e.pointerId;
+          g.boost = true;
+          setIsBoosting(true);
+          return;
+        }
+        g.steerPointerId = e.pointerId;
+        g.touch = { active: true, x, y };
+      }
+    };
+
+    const onUp = (e: PointerEvent) => {
+      e.preventDefault();
+      if (e.pointerId === g.steerPointerId) {
+        g.steerPointerId = -1;
+        g.touch.active = false;
+      }
+      if (e.pointerId === g.boostPointerId) {
+        g.boostPointerId = -1;
+        g.boost = false;
+        setIsBoosting(false);
+      }
+    };
+
+    cvs.addEventListener('pointerdown', onDown, { passive: false });
+    cvs.addEventListener('pointermove', onMove, { passive: false });
+    cvs.addEventListener('pointerup', onUp, { passive: false });
+    cvs.addEventListener('pointerleave', onUp, { passive: false });
+    window.addEventListener('keydown', (e) => {
+      if (g.screen === 'start') {
+        if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+          setShapeIdx(p => { const n = (p - 1 + SNAKE_SHAPES.length) % SNAKE_SHAPES.length; shapeRef.current = n; return n; });
+        } else if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+          setShapeIdx(p => { const n = (p + 1) % SNAKE_SHAPES.length; shapeRef.current = n; return n; });
+        } else if (e.code === 'Enter' || e.code === 'Space') {
+          startGame();
+        }
+        return;
+      }
+      if (g.screen === 'dead') { startGame(); return; }
+      if (e.code === 'Space') { g.boost = true; setIsBoosting(true); }
+    });
+    window.addEventListener('keyup', (e) => {
+      if (e.code === 'Space') { g.boost = false; setIsBoosting(false); }
+    });
+
+    // Custom event from Play button on start screen
+    const onCustomStart = () => startGame();
+    window.addEventListener('snake-start', onCustomStart);
+
+    // ── Seed food for start screen ────────────────────────
+    g.food = Array.from({ length: FOOD_COUNT }, () => {
+      const p = randInCircle(0, 0, MAP_RADIUS - 100);
+      return makeFood(p.x, p.y, Math.random() < 0.1);
+    });
+
+    // ── Main Loop ────────────────────────────────────────
+    let raf = 0;
+    const tick = () => {
+      const ctx = cvs.getContext('2d');
+      if (!ctx) { raf = requestAnimationFrame(tick); return; }
+
+      const W = cvs.width / (window.devicePixelRatio || 1);
+      const H = cvs.height / (window.devicePixelRatio || 1);
+
+      if (g.screen === 'playing') {
+        const p = g.player;
+        const wasAlive = p?.alive ?? false;
+
+        if (p?.alive) {
+          if (g.touch.active) {
+            const dx = g.touch.x - W / 2;
+            const dy = g.touch.y - H / 2;
+            if (dx * dx + dy * dy > 100) {
+              p.targetAngle = Math.atan2(dy, dx);
+            }
+          }
+          p.boosting = g.boost && p.segCount > MIN_SEGMENTS;
+          moveSnake(p, g.food, g.frame);
+
+          // Smooth camera follow
+          g.cam.x += (p.path[0].x - g.cam.x) * 0.08;
+          g.cam.y += (p.path[0].y - g.cam.y) * 0.08;
+
+          // Dynamic zoom: starts close, pulls out as snake grows
+          const targetZoom = Math.max(0.15, 1.0 - (p.segCount - INITIAL_SEGMENTS) / (MAX_SEGMENTS * 0.7));
+          g.zoom += (targetZoom - g.zoom) * 0.02;
+
+          if (wasAlive && !p.alive) handleDeath();
+        }
+
+        // Bot updates
+        const allSnakes: Snake[] = p?.alive ? [p, ...g.bots] : [...g.bots];
+        for (let i = 0; i < g.bots.length; i++) {
+          const b = g.bots[i];
+          if (!b.alive) {
+            b.respawnTimer++;
+            if (b.respawnTimer > 180) {
+              g.bots[i] = makeSnake(false);
+              g.bots[i].segCount = 10 + Math.floor(Math.random() * 40);
+            }
+            continue;
+          }
+          cacheSegmentPositions(b, g.frame);
+          updateBotAI(b, allSnakes, g.food);
+          moveSnake(b, g.food, g.frame);
+        }
+
+        if (p?.alive) cacheSegmentPositions(p, g.frame);
+
+        checkCollisions(allSnakes, g.food);
+        checkWallCollision(allSnakes, g.walls, g.food);
+        detectBodyClips(allSnakes, g.walls);
+        if (g.player && !g.player.alive && g.screen === 'playing') {
+          handleDeath();
+        }
+
+        while (g.food.length < FOOD_COUNT) {
+          const fp = randInCircle(0, 0, MAP_RADIUS - 100);
+          g.food.push(makeFood(fp.x, fp.y, false));
+        }
+
+        g.frame++;
+      }
+
+      renderGame(ctx, W, H, g.cam, g.player, g.bots, g.food, g.frame, g.zoom, g.walls);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+
+    return () => {
+      window.removeEventListener('resize', resize);
+      cvs.removeEventListener('pointerdown', onDown);
+      cvs.removeEventListener('pointermove', onMove);
+      cvs.removeEventListener('pointerup', onUp);
+      cvs.removeEventListener('pointerleave', onUp);
+      window.removeEventListener('snake-start', onCustomStart);
+      cancelAnimationFrame(raf);
+    };
+  }, []);
+
+  // Shape preview drawing helper
+  const previewShape = SNAKE_SHAPES[shapeIdx];
+
+  const getPreviewShapes = (): { type: 'circle' | 'box' | 'triangle'; color: string; stripe: string }[] => {
+    const c = '#ff4757', s = '#ff6b81';
+    switch (previewShape) {
+      case 'circle': return [{ type: 'circle', color: c, stripe: s }, { type: 'circle', color: s, stripe: c }, { type: 'circle', color: c, stripe: s }];
+      case 'box': return [{ type: 'box', color: c, stripe: s }, { type: 'box', color: s, stripe: c }, { type: 'box', color: c, stripe: s }];
+      case 'triangle': return [{ type: 'triangle', color: c, stripe: s }, { type: 'triangle', color: s, stripe: c }, { type: 'triangle', color: c, stripe: s }];
+      case 'mix_ct': return [{ type: 'circle', color: c, stripe: s }, { type: 'triangle', color: s, stripe: c }, { type: 'circle', color: c, stripe: s }];
+      case 'mix_cb': return [{ type: 'circle', color: c, stripe: s }, { type: 'box', color: s, stripe: c }, { type: 'circle', color: c, stripe: s }];
+      case 'mix_bt': return [{ type: 'box', color: c, stripe: s }, { type: 'triangle', color: s, stripe: c }, { type: 'box', color: c, stripe: s }];
+      case 'mix_all': return [{ type: 'circle', color: c, stripe: s }, { type: 'box', color: s, stripe: c }, { type: 'triangle', color: c, stripe: s }];
+    }
+  };
+
+  const handlePlay = () => {
+    shapeRef.current = shapeIdx;
+    window.dispatchEvent(new CustomEvent('snake-start'));
+  };
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0,
+      overflow: 'hidden', touchAction: 'none',
+      userSelect: 'none', WebkitUserSelect: 'none',
+      background: '#0b1120',
+    }}>
+      <canvas ref={canvasRef} style={{ display: 'block', width: '100vw', height: '100vh' }} />
+
+      {/* Start Screen with Shape Selector */}
+      {screen === 'start' && (
+        <div style={{
+          position: 'absolute', inset: 0,
+          display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(11,17,32,0.92)',
+          zIndex: 10,
+        }}>
+          <div style={{ color: '#fff', fontSize: 34, fontWeight: 800, letterSpacing: 3, margin: 0 }}>SNAKE</div>
+          <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 13, margin: '6px 0 28px', letterSpacing: 1 }}>Eat  Grow  Survive</div>
+
+          {/* Shape Preview */}
+          <div style={{ color: 'rgba(255,255,255,0.55)', fontSize: 12, marginBottom: 10, letterSpacing: 0.5 }}>SELECT SKIN</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 18 }}>
+            {/* Left Arrow */}
+            <div onClick={() => setShapeIdx(p => (p - 1 + SNAKE_SHAPES.length) % SNAKE_SHAPES.length)}
+              style={{ color: 'rgba(255,255,255,0.6)', fontSize: 32, cursor: 'pointer', padding: '8px 12px', userSelect: 'none' }}>
+              ‹
+            </div>
+            {/* Preview Shapes */}
+            <svg width="120" height="48" viewBox="0 0 120 48" style={{ overflow: 'visible' }}>
+              {getPreviewShapes().map((sh, i) => (
+                <g key={i} transform={`translate(${i * 40}, 0)`}>
+                  {sh.type === 'circle' && <circle cx="20" cy="24" r="14" fill={sh.color} />}
+                  {sh.type === 'box' && <rect x="5.3" y="5.3" width="29.4" height="29.4" fill={sh.color} rx="2" />}
+                  {sh.type === 'triangle' && <polygon points={`${34},24 ${10.3},${12.1} ${10.3},${35.9}`} fill={sh.color} />}
+                </g>
+              ))}
+            </svg>
+            {/* Right Arrow */}
+            <div onClick={() => setShapeIdx(p => (p + 1) % SNAKE_SHAPES.length)}
+              style={{ color: 'rgba(255,255,255,0.6)', fontSize: 32, cursor: 'pointer', padding: '8px 12px', userSelect: 'none' }}>
+              ›
+            </div>
+          </div>
+          <div style={{ color: '#fff', fontSize: 15, fontWeight: 600, marginTop: 8, minHeight: 22 }}>{SHAPE_LABELS[previewShape]}</div>
+          <div style={{ color: 'rgba(255,255,255,0.3)', fontSize: 11, marginTop: 2 }}>{shapeIdx + 1} / {SNAKE_SHAPES.length}</div>
+
+          {/* Play Button */}
+          <div onClick={handlePlay}
+            style={{
+              marginTop: 40,
+              color: '#fff', fontSize: 17, fontWeight: 600,
+              padding: '14px 48px', borderRadius: 30,
+              background: 'rgba(46,213,115,0.25)',
+              border: '1.5px solid rgba(46,213,115,0.5)',
+              cursor: 'pointer',
+              animation: 'pulse 2s ease-in-out infinite',
+            }}>
+            PLAY
+          </div>
+
+          <div style={{ color: 'rgba(255,255,255,0.25)', fontSize: 11, marginTop: 24, textAlign: 'center', lineHeight: 2 }}>
+            Touch to steer · Hold boost to sprint
+            <br />Arrow keys = browse skins · Enter = play
+          </div>
+        </div>
+      )}
+
+      {/* Death Screen */}
+      {screen === 'dead' && (
+        <div style={{
+          position: 'absolute', inset: 0,
+          display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(11,17,32,0.9)',
+          zIndex: 10, pointerEvents: 'none',
+        }}>
+          <div style={{ color: '#ff4757', fontSize: 30, fontWeight: 800, margin: 0, letterSpacing: 2 }}>YOU DIED</div>
+          <div style={{ color: 'rgba(255,255,255,0.65)', fontSize: 17, marginTop: 18 }}>
+            Score: <span style={{ color: '#fff', fontWeight: 700 }}>{deathScore.toLocaleString()}</span>
+          </div>
+          <div style={{ color: 'rgba(255,255,255,0.85)', fontSize: 17, marginTop: 40, animation: 'pulse 2s ease-in-out infinite' }}>Tap to Restart</div>
+        </div>
+      )}
+
+      {/* Boost Button */}
+      {screen === 'playing' && (
+        <div style={{
+          position: 'absolute', bottom: 24, right: 16,
+          width: 88, height: 88, borderRadius: '50%',
+          background: isBoosting
+            ? 'radial-gradient(circle, rgba(255,165,2,0.85), rgba(255,80,0,0.65))'
+            : 'radial-gradient(circle, rgba(255,165,2,0.25), rgba(255,80,0,0.1))',
+          border: isBoosting
+            ? '2.5px solid rgba(255,165,2,0.7)'
+            : '2.5px solid rgba(255,165,2,0.25)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 5, pointerEvents: 'none',
+          transition: 'all 0.12s ease',
+          boxShadow: isBoosting ? '0 0 35px rgba(255,165,2,0.35)' : 'none',
+        }}>
+          <svg width="34" height="34" viewBox="0 0 24 24" fill="none"
+            stroke={isBoosting ? 'rgba(255,240,180,1)' : 'rgba(255,200,50,0.7)'}
+            strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+          </svg>
+        </div>
+      )}
+
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.35; }
+        }
+      `}</style>
+    </div>
+  );
+}
